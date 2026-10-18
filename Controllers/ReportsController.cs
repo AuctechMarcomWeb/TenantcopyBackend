@@ -1,0 +1,126 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using TFMS_software_api.DTOs;
+using TFMS_software_api.Services;
+
+namespace TFMS_software_api.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+[Authorize]
+public class ReportsController : BaseApiController
+{
+    private readonly IReportService _service;
+    public ReportsController(IReportService service, IActivityLogService log)
+    {
+        _service     = service;
+        _activityLog = log;
+    }
+
+    /// <summary>GET api/reports/inventory?CampId=1&Status=Occupied</summary>
+    [HttpGet("inventory")]
+    public async Task<IActionResult> Inventory([FromQuery] ReportRequest request)
+        => Ok(await _service.GetInventoryReportAsync(request));
+
+    /// <summary>GET api/reports/tenants?Status=Active&CampId=1</summary>
+    [HttpGet("tenants")]
+    public async Task<IActionResult> Tenants([FromQuery] ReportRequest request)
+        => Ok(await _service.GetTenantReportAsync(request));
+
+    /// <summary>GET api/reports/partners?Status=Active</summary>
+    [HttpGet("partners")]
+    public async Task<IActionResult> Partners([FromQuery] ReportRequest request)
+        => Ok(await _service.GetPartnerReportAsync(request));
+
+    /// <summary>GET api/reports/camps</summary>
+    [HttpGet("camps")]
+    public async Task<IActionResult> Camps([FromQuery] ReportRequest request)
+        => Ok(await _service.GetCampReportAsync(request));
+
+    /// <summary>GET api/reports/waivers?TenantId=1&DateFrom=2026-01-01&DateTo=2026-06-30</summary>
+    [HttpGet("waivers")]
+    public async Task<IActionResult> Waivers([FromQuery] ReportRequest request)
+        => Ok(await _service.GetWaiverReportAsync(request));
+
+    /// <summary>GET api/reports/tenant-ledger/{tenantId}?contractId=CNT-0001&dateFrom=2026-01-01</summary>
+    [HttpGet("tenant-ledger/{tenantId:int}")]
+    public async Task<IActionResult> TenantLedger(int tenantId,
+        [FromQuery] string? contractId, [FromQuery] string? dateFrom, [FromQuery] string? dateTo)
+    {
+        var r = await _service.GetTenantLedgerAsync(tenantId, contractId, dateFrom, dateTo);
+        return r.Success ? Ok(r) : NotFound(r);
+    }
+
+    /// <summary>GET api/reports/tenant-rent-ledger/{tenantId}?dateFrom=2026-01-01&dateTo=2026-12-31&pageNumber=1&pageSize=50</summary>
+    [HttpGet("tenant-rent-ledger/{tenantId:int}")]
+    public async Task<IActionResult> TenantRentLedger(int tenantId,
+        [FromQuery] string? dateFrom, [FromQuery] string? dateTo,
+        [FromQuery] int pageNumber = 1, [FromQuery] int pageSize = 50)
+    {
+        var r = await _service.GetTenantRentLedgerAsync(tenantId, dateFrom, dateTo, pageNumber, pageSize);
+        return r.Success ? Ok(r) : NotFound(r);
+    }
+
+    /// <summary>GET api/reports/transactions?Month=June&Year=2026&CampId=1</summary>
+    [HttpGet("transactions")]
+    public async Task<IActionResult> Transactions([FromQuery] ReportRequest request)
+        => Ok(await _service.GetTransactionStatementAsync(request));
+
+    /// <summary>
+    /// GET api/reports/transaction-report
+    /// Filters: DateFrom, DateTo, AccountHead, Party, CampId, FundPool, Type (Income/Expense), Source, Mode, Role
+    /// Cards: NoOfPayments, TotalIncome, TotalExpense, TotalAmount
+    /// </summary>
+    [HttpGet("transaction-report")]
+    public async Task<IActionResult> TransactionReport([FromQuery] ReportRequest request)
+        => Ok(await _service.GetTransactionReportAsync(request));
+
+    /// <summary>GET api/reports/due?TenantId=1&CampId=2&Month=2026-07&CampbossId=5</summary>
+    [HttpGet("due")]
+    public async Task<IActionResult> Due([FromQuery] ReportRequest request)
+        => Ok(await _service.GetDueReportAsync(request));
+
+    /// <summary>
+    /// GET api/reports/camp-collection — Camp wise collection report
+    /// Filters: CampId, PartnerId, OwnerId, ContractId, DateFrom, DateTo, Month (yyyy-MM)
+    /// </summary>
+    [HttpGet("camp-collection")]
+    public async Task<IActionResult> CampCollection([FromQuery] ReportRequest request)
+        => Ok(await _service.GetCampCollectionReportAsync(request));
+
+    /// <summary>
+    /// GET api/reports/room-wise-collection?CampId=1 (CampId REQUIRED)
+    /// Filters: DateFrom, DateTo, Month (yyyy-MM), ContractStatus, Status (RoomStatus)
+    /// </summary>
+    [HttpGet("room-wise-collection")]
+    public async Task<IActionResult> RoomWiseCollection([FromQuery] ReportRequest request)
+    {
+        if (request.CampId == null) return BadRequest("CampId is required.");
+        return Ok(await _service.GetRoomWiseCollectionReportAsync(request));
+    }
+
+    /// <summary>GET api/reports/room-history/{roomId}</summary>
+    [HttpGet("room-history/{roomId:int}")]
+    public async Task<IActionResult> RoomHistory(int roomId)
+        => Ok(await _service.GetRoomHistoryAsync(roomId));
+
+    /// <summary>GET api/reports/outgoing-payments?DateFrom=2026-01-01</summary>
+    [HttpGet("outgoing-payments")]
+    public async Task<IActionResult> OutgoingPayments([FromQuery] ReportRequest request)
+        => Ok(await _service.GetOutgoingPaymentsAsync(request));
+
+    /// <summary>POST api/reports/make-payment</summary>
+    [HttpPost("make-payment")]
+    public async Task<IActionResult> MakePayment([FromBody] MakePaymentRequest request)
+    {
+        if (!ModelState.IsValid) return BadRequest(ModelState);
+        var r = await _service.MakePaymentAsync(request);
+
+        if (r.Success)
+            await Log(ActivityType.Insert, ActivityModule.Payments,
+                $"MakePayment: {request.PaymentType} to '{request.RecipientName}', Amount {request.Amount}, Mode {request.PaymentMode}",
+                r.Data?.Id.ToString() ?? "", "Payment");
+
+        return r.Success ? Ok(r) : BadRequest(r);
+    }
+}

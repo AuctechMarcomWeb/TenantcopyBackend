@@ -1,0 +1,501 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Data.SqlClient;
+using System.Data;
+using TFMS_software_api.Common;
+using TFMS_software_api.DTOs;
+using TFMS_software_api.Repositories;
+using TFMS_software_api.Services;
+
+namespace TFMS_software_api.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+[Authorize]
+public class SecurityDepositController : BaseApiController
+{
+    private readonly IDbConnectionFactory _factory;
+    public SecurityDepositController(IDbConnectionFactory factory, IActivityLogService log)
+    {
+        _factory     = factory;
+        _activityLog = log;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    /// <summary>GET api/securitydeposit/status/{contractId}</summary>
+    [HttpGet("status/{contractId}")]
+    public async Task<IActionResult> GetStatus(string contractId)
+    {
+        await using var conn = _factory.CreateConnection();
+        await conn.OpenAsync();
+
+        await using var cmd = new SqlCommand("sp_GetSecurityDepositStatus", conn)
+        {
+            CommandType = CommandType.StoredProcedure
+        };
+        cmd.Parameters.AddWithValue("@ContractId", contractId);
+
+        await using var r = await cmd.ExecuteReaderAsync();
+        if (!await r.ReadAsync())
+            return NotFound(ApiResponse<object>.Fail("Contract not found."));
+
+        return Ok(ApiResponse<SecurityDepositStatusResponse>.Ok(new SecurityDepositStatusResponse
+        {
+            ContractId     = r.GetString(r.GetOrdinal("ContractId")),
+            TenantName     = r.IsDBNull(r.GetOrdinal("TenantName")) ? "" : r.GetString(r.GetOrdinal("TenantName")),
+            DepositAmount  = r.GetDecimal(r.GetOrdinal("DepositAmount")),
+            DepositPaid    = r.GetDecimal(r.GetOrdinal("DepositPaid")),
+            DepositBalance = r.GetDecimal(r.GetOrdinal("DepositBalance")),
+            Status         = r.GetString(r.GetOrdinal("Status")),
+        }, "Security deposit status retrieved."));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    /// <summary>POST api/securitydeposit/receive — Receive security deposit from tenant</summary>
+    [HttpPost("receive")]
+    public async Task<IActionResult> Receive([FromBody] ReceiveSecurityDepositRequest req)
+    {
+        if (string.IsNullOrEmpty(req.ContractId))
+            return BadRequest(ApiResponse<object>.Fail("ContractId required."));
+        if (req.Amount <= 0)
+            return BadRequest(ApiResponse<object>.Fail("Amount must be greater than 0."));
+
+        await using var conn = _factory.CreateConnection();
+        await conn.OpenAsync();
+
+        await using var cmd = new SqlCommand("sp_ReceiveSecurityDeposit", conn)
+        {
+            CommandType = CommandType.StoredProcedure
+        };
+
+        cmd.Parameters.AddWithValue("@ContractId",    req.ContractId);
+        cmd.Parameters.AddWithValue("@Amount",        req.Amount);
+        cmd.Parameters.AddWithValue("@PaidDate",      req.PaidDate);
+        cmd.Parameters.AddWithValue("@PaymentMode",   req.PaymentMode);
+        cmd.Parameters.AddWithValue("@PaymentModeId", (object?)req.PaymentModeId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@ChequeNumber",  req.ChequeNumber ?? "");
+        cmd.Parameters.AddWithValue("@FundPoolId",    (object?)req.FundPoolId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@FundPoolName",  req.FundPoolName ?? "");
+        cmd.Parameters.AddWithValue("@ReceivedBy",    req.ReceivedBy ?? "Admin");
+        cmd.Parameters.AddWithValue("@Notes",         req.Notes ?? "");
+        cmd.Parameters.AddWithValue("@PaymentStatus", req.PaymentStatus == "Advanced" ? "Advanced" : "Paid");
+
+        var pNewPaid   = new SqlParameter("@NewPaid",   SqlDbType.Decimal) { Direction = ParameterDirection.Output, Precision = 18, Scale = 2 };
+        var pNewStatus = new SqlParameter("@NewStatus", SqlDbType.NVarChar, 50) { Direction = ParameterDirection.Output };
+        cmd.Parameters.Add(pNewPaid);
+        cmd.Parameters.Add(pNewStatus);
+
+        await cmd.ExecuteNonQueryAsync();
+
+        var newPaid   = (decimal)pNewPaid.Value;
+        var newStatus = pNewStatus.Value?.ToString() ?? "Received";
+
+        // ★ Sync to AccountMasters (Nature='Camp')
+        await using (var syncCmd = new SqlCommand("sp_SyncSDReceiveToAccountMaster", conn) { CommandType = CommandType.StoredProcedure })
+        {
+            syncCmd.Parameters.AddWithValue("@ContractId", req.ContractId);
+            syncCmd.Parameters.AddWithValue("@Amount", req.Amount);
+            syncCmd.Parameters.AddWithValue("@PaidDate", req.PaidDate);
+            syncCmd.Parameters.AddWithValue("@PaymentMode", req.PaymentMode);
+            syncCmd.Parameters.AddWithValue("@FundPoolId", (object?)req.FundPoolId ?? DBNull.Value);
+            await syncCmd.ExecuteNonQueryAsync();
+        }
+
+        await Log(ActivityType.Insert, ActivityModule.SecurityDeposit,
+            $"SD Received: Contract {req.ContractId}, Amount {req.Amount}, Mode {req.PaymentMode}, Status {newStatus}",
+            req.ContractId, "SecurityDeposit");
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            contractId     = req.ContractId,
+            amountReceived = req.Amount,
+            totalPaid      = newPaid,
+            status         = newStatus,
+        }, $"Security deposit of {req.Amount} received. Status: {newStatus}"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// DELETE api/securitydeposit/receive/{txnRecordId}
+    /// Deletes ONE received SD entry and reverts all updates/inserts:
+    ///   Contracts (paid/status), FundPools (balance), ContractRooms (paid/due)
+    ///   TxnRecords, Incomes, ContractRoomsTrns — all soft-deleted.
+    /// </summary>
+    [HttpDelete("receive/{txnRecordId:int}")]
+    public async Task<IActionResult> DeleteReceived(int txnRecordId)
+    {
+        await using var conn = _factory.CreateConnection();
+        await conn.OpenAsync();
+
+        await using var cmd = new SqlCommand("sp_DeleteSecurityDeposit", conn)
+        {
+            CommandType    = CommandType.StoredProcedure,
+            CommandTimeout = 60
+        };
+        cmd.Parameters.AddWithValue("@TxnRecordId", txnRecordId);
+        cmd.Parameters.AddWithValue("@DeletedBy",   CurrentUserId == 0 ? DBNull.Value : (object)CurrentUserId);
+
+        var newPaidParam = new SqlParameter("@NewPaid", SqlDbType.Decimal)
+            { Precision = 18, Scale = 2, Direction = ParameterDirection.Output };
+        var newStatusParam = new SqlParameter("@NewStatus", SqlDbType.NVarChar, 50)
+            { Direction = ParameterDirection.Output };
+        cmd.Parameters.Add(newPaidParam);
+        cmd.Parameters.Add(newStatusParam);
+
+        try
+        {
+            await cmd.ExecuteNonQueryAsync();
+        }
+        catch (SqlException ex)
+        {
+            return BadRequest(ApiResponse<object>.Fail(ex.Message));
+        }
+
+        var newPaid   = newPaidParam.Value   == DBNull.Value ? 0m : (decimal)newPaidParam.Value;
+        var newStatus = newStatusParam.Value == DBNull.Value ? "" : (string)newStatusParam.Value;
+
+        await Log(ActivityType.Delete, ActivityModule.SecurityDeposit,
+            $"SD Receipt deleted: TxnRecordId {txnRecordId}, reverted. New status {newStatus}",
+            txnRecordId.ToString(), "SecurityDeposit");
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            txnRecordId,
+            totalPaid = newPaid,
+            status    = newStatus,
+        }, $"Security deposit receipt deleted and reverted. Status: {newStatus}"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// PATCH api/securitydeposit/trns/{contractId}/payment-status
+    /// ContractRoomsTrns ki us contractId ki SAARI rows ka PaymentStatus update karo
+    /// TxnType = 'SD-CR' filter bhi lagega — sirf SD rows update hongi
+    /// Values: 'Paid' | 'Advanced'
+    /// </summary>
+    [HttpPatch("trns/{contractId}/payment-status")]
+    public async Task<IActionResult> UpdateTrnsPaymentStatus(string contractId, [FromBody] UpdateTrnsPaymentStatusRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.PaymentStatus))
+            return BadRequest(ApiResponse<object>.Fail("PaymentStatus required."));
+
+        if (req.PaymentStatus != "Paid" && req.PaymentStatus != "Advanced")
+            return BadRequest(ApiResponse<object>.Fail("PaymentStatus must be 'Paid' or 'Advanced'."));
+
+        await using var conn = _factory.CreateConnection();
+        await conn.OpenAsync();
+
+        await using var cmd = new SqlCommand(@"
+            UPDATE ContractRoomsTrns
+            SET    PaymentStatus = @PaymentStatus,
+                   UpdatedAt     = GETDATE()
+            WHERE  ContractId             = @ContractId
+              AND  TxnType               = 'SD-CR'
+              AND  ISNULL(IsDeleted, 0)  = 0;
+
+            SELECT @@ROWCOUNT AS AffectedRows;", conn);
+
+        cmd.Parameters.AddWithValue("@ContractId",    contractId);
+        cmd.Parameters.AddWithValue("@PaymentStatus", req.PaymentStatus);
+
+        var affected = (int)(await cmd.ExecuteScalarAsync() ?? 0);
+
+        if (affected == 0)
+            return NotFound(ApiResponse<object>.Fail(
+                $"No SD-CR records found for ContractId '{contractId}' or already deleted."));
+
+        await Log(ActivityType.Update, ActivityModule.SecurityDeposit,
+            $"ContractRoomsTrns SD-CR rows for Contract '{contractId}' PaymentStatus updated to '{req.PaymentStatus}' ({affected} rows)",
+            contractId, "ContractRoomsTrns");
+
+        return Ok(ApiResponse<object>.Ok(
+            new { contractId, paymentStatus = req.PaymentStatus, updatedRows = affected },
+            $"PaymentStatus updated to '{req.PaymentStatus}' for {affected} row(s)."));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    /// <summary>POST api/securitydeposit/settle — Settle deposit (adjust / refund / forfeit)</summary>
+    [HttpPost("settle")]
+    public async Task<IActionResult> Settle([FromBody] SettleSecurityDepositRequest req)
+    {
+        if (string.IsNullOrEmpty(req.ContractId))
+            return BadRequest(ApiResponse<object>.Fail("ContractId required."));
+
+        // ★ VALIDATION REMOVED - No amount restrictions
+        var totalSettled = req.AdjustAmount + req.RefundAmount + req.ForfeitAmount;
+        if (totalSettled <= 0)
+            return BadRequest(ApiResponse<object>.Fail("At least one of AdjustAmount, RefundAmount, or ForfeitAmount must be > 0."));
+
+        await using var conn = _factory.CreateConnection();
+        await conn.OpenAsync();
+
+        // ★ RefundDate from payload (user-provided date)
+        var refundDate = req.RefundDate ?? DateTime.Now;
+
+        // ── Step 1: Main Settlement (Contracts table update) ───────────────────
+        await using var cmd = new SqlCommand("sp_SettleSecurityDeposit", conn)
+        {
+            CommandType = CommandType.StoredProcedure
+        };
+
+        cmd.Parameters.AddWithValue("@ContractId",    req.ContractId);
+        cmd.Parameters.AddWithValue("@AdjustAmount",  req.AdjustAmount);
+        cmd.Parameters.AddWithValue("@RefundAmount",  req.RefundAmount);
+        cmd.Parameters.AddWithValue("@ForfeitAmount", req.ForfeitAmount);
+        cmd.Parameters.AddWithValue("@FundPoolId",    (object?)req.FundPoolId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@FundPoolName",  req.FundPoolName ?? "");
+        cmd.Parameters.AddWithValue("@Notes",         req.Notes ?? "");
+        cmd.Parameters.AddWithValue("@SettledBy",     req.SettledBy ?? "Admin");
+
+        var pNewStatus = new SqlParameter("@NewStatus", SqlDbType.NVarChar, 50) { Direction = ParameterDirection.Output };
+        cmd.Parameters.Add(pNewStatus);
+
+        await cmd.ExecuteNonQueryAsync();
+
+        var newStatus = pNewStatus.Value?.ToString() ?? "Settled";
+
+        // ── Step 1.5: Update Contracts UpdatedAt with RefundDate ──────────────
+        await using (var updateContractCmd = new SqlCommand(@"
+            UPDATE Contracts
+            SET UpdatedAt = @RefundDate
+            WHERE ContractId = @ContractId
+              AND ISNULL(IsDeleted, 0) = 0;
+        ", conn))
+        {
+            updateContractCmd.Parameters.AddWithValue("@ContractId", req.ContractId);
+            updateContractCmd.Parameters.AddWithValue("@RefundDate", refundDate);
+            await updateContractCmd.ExecuteNonQueryAsync();
+        }
+
+        // ── Step 1.6: Update TxnRecords PaidDate with RefundDate ──────────────
+        // sp_SettleSecurityDeposit creates TxnRecords with GETDATE(), update to RefundDate
+        await using (var updateTxnCmd = new SqlCommand(@"
+            UPDATE TxnRecords
+            SET PaidDate = CAST(@RefundDate AS DATE),
+                UpdatedAt = GETDATE()
+            WHERE ContractId = @ContractId
+              AND TxnType IN ('SD-REF', 'SD-ADJ', 'SD-FORFEIT')
+              AND CAST(CreatedAt AS DATE) = CAST(GETDATE() AS DATE)
+              AND ISNULL(IsDeleted, 0) = 0;
+        ", conn))
+        {
+            updateTxnCmd.Parameters.AddWithValue("@ContractId", req.ContractId);
+            updateTxnCmd.Parameters.AddWithValue("@RefundDate", refundDate);
+            await updateTxnCmd.ExecuteNonQueryAsync();
+        }
+
+        // ── Step 1.7: Update ContractRoomsTrns TxnDate & Month with RefundDate ────────
+        await using (var updateRoomTrnsCmd = new SqlCommand(@"
+            UPDATE ContractRoomsTrns
+            SET TxnDate = CAST(@RefundDate AS DATE),
+                Month = CASE MONTH(@RefundDate) 
+                    WHEN 1 THEN 'Jan' WHEN 2 THEN 'Feb' WHEN 3 THEN 'Mar'
+                    WHEN 4 THEN 'Apr' WHEN 5 THEN 'May' WHEN 6 THEN 'Jun'
+                    WHEN 7 THEN 'Jul' WHEN 8 THEN 'Aug' WHEN 9 THEN 'Sep'
+                    WHEN 10 THEN 'Oct' WHEN 11 THEN 'Nov' WHEN 12 THEN 'Dec'
+                END + RIGHT(CAST(YEAR(@RefundDate) AS NVARCHAR), 2),
+                UpdatedAt = GETDATE()
+            WHERE ContractId = @ContractId
+              AND TxnType IN ('SD-REF', 'SD-ADJ', 'SD-FORFEIT')
+              AND CAST(CreatedAt AS DATE) = CAST(GETDATE() AS DATE)
+              AND ISNULL(IsDeleted, 0) = 0;
+        ", conn))
+        {
+            updateRoomTrnsCmd.Parameters.AddWithValue("@ContractId", req.ContractId);
+            updateRoomTrnsCmd.Parameters.AddWithValue("@RefundDate", refundDate);
+            await updateRoomTrnsCmd.ExecuteNonQueryAsync();
+        }
+
+        // ── Step 2: Get Contract Details & FundPool Code for manual inserts ───
+        string contractCode = req.ContractId;
+        string tenantName = "Tenant";
+        int campId = 0;
+        string campName = "";
+        int fundPoolId = req.FundPoolId ?? 0;
+        string fundPoolName = req.FundPoolName ?? "";
+        string fundPoolCode = ""; // ★ FundMasters.Code
+
+        // Try to get contract details (optional, won't fail if columns don't exist)
+        try
+        {
+            await using var detailCmd = new SqlCommand(@"
+                SELECT TOP 1 
+                    c.ContractId,
+                    t.TenantName,
+                    c.CampId,
+                    cm.CampName
+                FROM Contracts c
+                LEFT JOIN Tenants t ON c.TenantId = t.TenantId
+                LEFT JOIN Camps cm ON c.CampId = cm.CampId
+                WHERE c.ContractId = @ContractId
+                  AND ISNULL(c.IsDeleted, 0) = 0;
+            ", conn);
+            detailCmd.Parameters.AddWithValue("@ContractId", req.ContractId);
+            
+            await using var reader = await detailCmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                tenantName = reader.IsDBNull(reader.GetOrdinal("TenantName")) ? "Tenant" : reader.GetString(reader.GetOrdinal("TenantName"));
+                campId = reader.IsDBNull(reader.GetOrdinal("CampId")) ? 0 : reader.GetInt32(reader.GetOrdinal("CampId"));
+                campName = reader.IsDBNull(reader.GetOrdinal("CampName")) ? "" : reader.GetString(reader.GetOrdinal("CampName"));
+            }
+        }
+        catch { /* Ignore if columns don't exist */ }
+
+        // ★ Get FundPool Code from FundPools table
+        if (fundPoolId > 0)
+        {
+            try
+            {
+                await using var fundCmd = new SqlCommand(@"
+                    SELECT TOP 1 Code 
+                    FROM FundPools 
+                    WHERE Id = @FundPoolId 
+                      AND ISNULL(IsDeleted, 0) = 0;
+                ", conn);
+                fundCmd.Parameters.AddWithValue("@FundPoolId", fundPoolId);
+                
+                var result = await fundCmd.ExecuteScalarAsync();
+                fundPoolCode = result?.ToString() ?? "";
+            }
+            catch { /* Ignore if table/column doesn't exist */ }
+        }
+
+        // ── Step 3: Manual INSERT to AccountMasters with RefundDate ───────────
+        if (req.RefundAmount > 0)
+        {
+            var voucherNo = $"SD-REF-{req.ContractId}-{DateTime.Now:yyyyMMddHHmmss}";
+            
+            await using var insertAccCmd = new SqlCommand(@"
+                INSERT INTO AccountMasters 
+                (VoucherNo, TransDate, PaymentDate, PaymentType, Mode, FundPool, FundPoolName, 
+                 Amount, Nature, RecipientRole, RecipientName, Purpose, CreatedAt, RecipientId, 
+                 CampId, CampName, AccountId, IsDeleted)
+                VALUES 
+                (@VoucherNo, @RefundDate, @RefundDate, 'Camp', @Mode, @FundPool, @FundPoolName,
+                 @Amount, 'Expense', 'Tenant', @TenantName, @Purpose, GETDATE(), 0,
+                 @CampId, @CampName, @ContractId, 0);
+            ", conn);
+            
+            insertAccCmd.Parameters.AddWithValue("@VoucherNo", voucherNo);
+            insertAccCmd.Parameters.AddWithValue("@RefundDate", refundDate);
+            insertAccCmd.Parameters.AddWithValue("@Mode", req.PaymentMode ?? "Cash");
+            insertAccCmd.Parameters.AddWithValue("@FundPool", fundPoolCode); // ★ FundMasters.Code
+            insertAccCmd.Parameters.AddWithValue("@FundPoolName", fundPoolName);
+            insertAccCmd.Parameters.AddWithValue("@Amount", req.RefundAmount);
+            insertAccCmd.Parameters.AddWithValue("@TenantName", tenantName);
+            insertAccCmd.Parameters.AddWithValue("@Purpose", $"SD Refund - Contract {contractCode}");
+            insertAccCmd.Parameters.AddWithValue("@CampId", campId == 0 ? DBNull.Value : (object)campId);
+            insertAccCmd.Parameters.AddWithValue("@CampName", campName ?? "");
+            insertAccCmd.Parameters.AddWithValue("@ContractId", req.ContractId);
+            
+            await insertAccCmd.ExecuteNonQueryAsync();
+        }
+
+        // ── Step 4: Update Expenses TransDate, Date & Head with RefundDate ────────────
+        // sp_SettleSecurityDeposit already inserts Expenses, just update the dates and Head
+        if (req.RefundAmount > 0)
+        {
+            await using var updateExpCmd = new SqlCommand(@"
+                UPDATE Expenses
+                SET TransDate = @RefundDate,
+                    Date = CAST(@RefundDate AS DATE),
+                    Head = 'SD',
+                    Nature = 'Camp',
+                    UpdatedAt = GETDATE()
+                WHERE ExpenseId IN (
+                    SELECT TOP 1 ExpenseId 
+                    FROM Expenses 
+                    WHERE (Head = 'Security Deposit Refund' OR Purpose LIKE '%SD Refund%')
+                      AND TransDate IS NULL
+                      AND CAST(CreatedAt AS DATE) = CAST(GETDATE() AS DATE)
+                      AND ISNULL(IsDeleted, 0) = 0
+                    ORDER BY ExpenseId DESC
+                );
+            ", conn);
+            
+            updateExpCmd.Parameters.AddWithValue("@RefundDate", refundDate);
+            await updateExpCmd.ExecuteNonQueryAsync();
+        }
+
+        // ── Step 5: SKIP ContractRoomsTrns (requires RoomId which is not available) ─
+
+        // ── Step 6: Update FundPool Balance (Deduct refund amount) ────────────
+        if (req.RefundAmount > 0 && fundPoolId > 0)
+        {
+            await using var updateFundCmd = new SqlCommand(@"
+                UPDATE FundPools
+                SET Balance = Balance - @Amount,
+                    UpdatedAt = GETDATE()
+                WHERE Id = @FundPoolId;
+            ", conn);
+            
+            updateFundCmd.Parameters.AddWithValue("@Amount", req.RefundAmount);
+            updateFundCmd.Parameters.AddWithValue("@FundPoolId", fundPoolId);
+            
+            await updateFundCmd.ExecuteNonQueryAsync();
+        }
+
+        // ── Step 7: Forfeit case - Manual INSERT to AccountMasters ────────────
+        if (req.ForfeitAmount > 0)
+        {
+            var voucherNo = $"SD-FORFEIT-{req.ContractId}-{DateTime.Now:yyyyMMddHHmmss}";
+            
+            await using var insertForfeitCmd = new SqlCommand(@"
+                INSERT INTO AccountMasters 
+                (VoucherNo, TransDate, PaymentDate, PaymentType, Mode, FundPool, FundPoolName, 
+                 Amount, Nature, RecipientRole, RecipientName, Purpose, CreatedAt, RecipientId, 
+                 CampId, CampName, AccountId, IsDeleted)
+                VALUES 
+                (@VoucherNo, @RefundDate, @RefundDate, 'Camp', 'Cash', @FundPool, @FundPoolName,
+                 @Amount, 'Income', 'Tenant', @TenantName, @Purpose, GETDATE(), 0,
+                 @CampId, @CampName, @ContractId, 0);
+            ", conn);
+            
+            insertForfeitCmd.Parameters.AddWithValue("@VoucherNo", voucherNo);
+            insertForfeitCmd.Parameters.AddWithValue("@RefundDate", refundDate);
+            insertForfeitCmd.Parameters.AddWithValue("@FundPool", fundPoolCode); // ★ FundMasters.Code
+            insertForfeitCmd.Parameters.AddWithValue("@FundPoolName", fundPoolName);
+            insertForfeitCmd.Parameters.AddWithValue("@Amount", req.ForfeitAmount);
+            insertForfeitCmd.Parameters.AddWithValue("@TenantName", tenantName);
+            insertForfeitCmd.Parameters.AddWithValue("@Purpose", $"SD Forfeit/Penalty - Contract {contractCode}");
+            insertForfeitCmd.Parameters.AddWithValue("@CampId", campId == 0 ? DBNull.Value : (object)campId);
+            insertForfeitCmd.Parameters.AddWithValue("@CampName", campName ?? "");
+            insertForfeitCmd.Parameters.AddWithValue("@ContractId", req.ContractId);
+            
+            await insertForfeitCmd.ExecuteNonQueryAsync();
+
+            // Update FundPool Balance (Add forfeit amount)
+            if (fundPoolId > 0)
+            {
+                await using var updateFundCmd = new SqlCommand(@"
+                    UPDATE FundPools
+                    SET Balance = Balance + @Amount,
+                        UpdatedAt = GETDATE()
+                    WHERE Id = @FundPoolId;
+                ", conn);
+                
+                updateFundCmd.Parameters.AddWithValue("@Amount", req.ForfeitAmount);
+                updateFundCmd.Parameters.AddWithValue("@FundPoolId", fundPoolId);
+                
+                await updateFundCmd.ExecuteNonQueryAsync();
+            }
+        }
+
+        // ── Step 8: Activity Log ───────────────────────────────────────────────
+        await Log(ActivityType.Update, ActivityModule.SecurityDeposit,
+            $"SD Settled: Contract {req.ContractId}, Adjust {req.AdjustAmount}, Refund {req.RefundAmount}, Forfeit {req.ForfeitAmount}, RefundDate {refundDate:yyyy-MM-dd}, Status {newStatus}",
+            req.ContractId, "SecurityDeposit");
+
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            contractId   = req.ContractId,
+            adjusted     = req.AdjustAmount,
+            refunded     = req.RefundAmount,
+            forfeited    = req.ForfeitAmount,
+            totalSettled,
+            refundDate   = refundDate,
+            newStatus,
+        }, "Security deposit settled successfully."));
+    }
+}

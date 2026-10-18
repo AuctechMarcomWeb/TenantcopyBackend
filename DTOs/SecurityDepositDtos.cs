@@ -1,0 +1,52 @@
+namespace TFMS_software_api.DTOs;
+
+public class ReceiveSecurityDepositRequest
+{
+    public string   ContractId     { get; set; } = string.Empty;
+    public decimal  Amount         { get; set; }
+    public DateTime PaidDate       { get; set; }
+    public string   PaymentMode    { get; set; } = "Cash";
+    public int?     PaymentModeId  { get; set; }
+    public string   ChequeNumber   { get; set; } = string.Empty;
+    public int?     FundPoolId     { get; set; }
+    public string   FundPoolName   { get; set; } = string.Empty;
+    public string   ReceivedBy     { get; set; } = string.Empty;
+    public string   Notes          { get; set; } = string.Empty;
+    /// <summary>
+    /// ContractRoomsTrns.PaymentStatus — 'Paid' (default) ya 'Advanced'
+    /// </summary>
+    public string   PaymentStatus  { get; set; } = "Paid";
+}
+
+public class SecurityDepositStatusResponse
+{
+    public string   ContractId          { get; set; } = string.Empty;
+    public string   TenantName          { get; set; } = string.Empty;
+    public decimal  DepositAmount       { get; set; }
+    public decimal  DepositPaid         { get; set; }
+    public decimal  DepositBalance      { get; set; }
+    public string   Status              { get; set; } = "Pending";
+}
+
+public class UpdateTrnsPaymentStatusRequest
+{
+    /// <summary>'Paid' or 'Advanced'</summary>
+    public string PaymentStatus { get; set; } = "Paid";
+}
+
+public class SettleSecurityDepositRequest
+{
+    public string   ContractId      { get; set; } = string.Empty;
+    public decimal  AdjustAmount    { get; set; }  // Against rent dues
+    public decimal  RefundAmount    { get; set; }  // Return to tenant (no validation, can be any amount)
+    public DateTime? RefundDate     { get; set; }  // Date of refund transaction
+    public decimal  ForfeitAmount   { get; set; }  // Damage/penalty deduction
+    public int?     FundPoolId      { get; set; }
+    public string   FundPoolName    { get; set; } = string.Empty;
+    public string   Notes           { get; set; } = string.Empty;
+    public string   SettledBy       { get; set; } = "Admin";
+    public string   PaymentMode     { get; set; } = "Cash";  // For TxnRecords entry
+    public int?     PaymentModeId   { get; set; }
+    public string   ChequeNumber    { get; set; } = string.Empty;
+    public string   ReceivedBy      { get; set; } = string.Empty;
+}

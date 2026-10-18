@@ -1,0 +1,17 @@
+using TFMS_software_api.DTOs;
+using TFMS_software_api.Models;
+
+namespace TFMS_software_api.Repositories;
+
+public interface IContractRepository
+{
+    Task<(IEnumerable<Contract> Data, int TotalRecords)> GetAllAsync(ContractListRequest request);
+    Task<Contract?>  GetByIdAsync(int id);
+    Task<Contract?>  GetByContractIdAsync(string contractId);
+    Task<string>     CreateAsync(Contract contract, List<ContractRoomItem>? rooms = null);   // returns ContractId
+    Task<bool>       UpdateStatusAsync(string contractId, string status);
+    Task<bool>       DeleteAsync(int id, int? deletedBy = null);
+    Task<bool>       UpdateScheduleAsync(string contractId, string scheduleJson, string? installmentType = null);
+    Task<(bool Success, bool PaymentStarted)> UpdateContractAsync(UpdateContractRequest request);
+    Task<ContractDocResponse?> GetDocumentAsync(string contractId);
+}
